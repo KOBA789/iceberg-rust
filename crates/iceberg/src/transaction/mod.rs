@@ -192,6 +192,34 @@ impl Transaction {
             .build())
     }
 
+    /// Build a `TableCommit` from the transaction's actions without reloading the table
+    /// or calling `catalog.update_table()`. The caller is responsible for submitting
+    /// the returned `TableCommit` to a catalog directly.
+    ///
+    /// This is useful when the caller needs to control the commit lifecycle,
+    /// e.g. to avoid automatic retries that would regenerate requirements.
+    pub async fn prepare(self) -> Result<TableCommit> {
+        let mut current_table = self.table.clone();
+        let mut existing_updates: Vec<TableUpdate> = vec![];
+        let mut existing_requirements: Vec<TableRequirement> = vec![];
+
+        for action in &self.actions {
+            let action_commit = Arc::clone(action).commit(&current_table).await?;
+            current_table = Self::apply(
+                current_table,
+                action_commit,
+                &mut existing_updates,
+                &mut existing_requirements,
+            )?;
+        }
+
+        Ok(TableCommit::builder()
+            .ident(self.table.identifier().to_owned())
+            .updates(existing_updates)
+            .requirements(existing_requirements)
+            .build())
+    }
+
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
         let refreshed = catalog.load_table(self.table.identifier()).await?;
 

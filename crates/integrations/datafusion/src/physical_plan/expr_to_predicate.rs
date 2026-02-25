@@ -292,6 +292,8 @@ fn reverse_predicate_operator(op: PredicateOperator) -> PredicateOperator {
 }
 
 const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
+const MICROS_PER_SECOND: i64 = 1_000_000;
+const MICROS_PER_MILLISECOND: i64 = 1_000;
 
 /// Convert a scalar value to an iceberg datum.
 fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
@@ -309,14 +311,28 @@ fn scalar_value_to_datum(value: &ScalarValue) -> Option<Datum> {
         ScalarValue::LargeBinary(Some(v)) => Some(Datum::binary(v.clone())),
         ScalarValue::Date32(Some(v)) => Some(Datum::date(*v)),
         ScalarValue::Date64(Some(v)) => Some(Datum::date((*v / MILLIS_PER_DAY) as i32)),
-        // Timestamp conversions
-        // Note: TimestampSecond and TimestampMillisecond are not handled here because
-        // DataFusion's type coercion always converts them to match the column type
-        // (either TimestampMicrosecond or TimestampNanosecond) before predicate pushdown.
-        // See unit tests for how those conversions would work if needed.
-        ScalarValue::TimestampMicrosecond(Some(v), _) => Some(Datum::timestamp_micros(*v)),
-        ScalarValue::TimestampNanosecond(Some(v), _) => Some(Datum::timestamp_nanos(*v)),
+        ScalarValue::TimestampSecond(Some(v), tz) => {
+            interpret_timestamptz_micros(v.checked_mul(MICROS_PER_SECOND)?, tz.as_deref())
+        }
+        ScalarValue::TimestampMillisecond(Some(v), tz) => {
+            interpret_timestamptz_micros(v.checked_mul(MICROS_PER_MILLISECOND)?, tz.as_deref())
+        }
+        ScalarValue::TimestampMicrosecond(Some(v), tz) => {
+            interpret_timestamptz_micros(*v, tz.as_deref())
+        }
+        ScalarValue::TimestampNanosecond(Some(v), Some(_)) => Some(Datum::timestamptz_nanos(*v)),
+        ScalarValue::TimestampNanosecond(Some(v), None) => Some(Datum::timestamp_nanos(*v)),
         _ => None,
+    }
+}
+
+fn interpret_timestamptz_micros(micros: i64, tz: Option<impl AsRef<str>>) -> Option<Datum> {
+    // We care whether the timezone is present, so that we can construct the
+    // right iceberg type (timestamp vs timestamptz). However, there's no
+    // support for storing the timezone itself in the `Datum`.
+    match tz {
+        Some(_) => Some(Datum::timestamptz_micros(micros)),
+        None => Some(Datum::timestamp_micros(micros)),
     }
 }
 
@@ -540,36 +556,49 @@ mod tests {
     fn test_scalar_value_to_datum_timestamp() {
         use datafusion::common::ScalarValue;
 
-        // Test TimestampMicrosecond - maps directly to Datum::timestamp_micros
+        // Test TimestampMicrosecond without timezone - maps to Datum::timestamp_micros
         let ts_micros = 1672876800000000i64; // 2023-01-05 00:00:00 UTC in microseconds
         let datum =
             super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(Some(ts_micros), None));
         assert_eq!(datum, Some(Datum::timestamp_micros(ts_micros)));
 
-        // Test TimestampNanosecond - maps to Datum::timestamp_nanos to preserve precision
+        // Test TimestampMicrosecond with timezone - maps to Datum::timestamptz_micros
+        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(
+            Some(ts_micros),
+            Some("+00:00".into()),
+        ));
+        assert_eq!(datum, Some(Datum::timestamptz_micros(ts_micros)));
+
+        // Test TimestampNanosecond without timezone - maps to Datum::timestamp_nanos
         let ts_nanos = 1672876800000000500i64; // 2023-01-05 00:00:00.000000500 UTC in nanoseconds
         let datum =
             super::scalar_value_to_datum(&ScalarValue::TimestampNanosecond(Some(ts_nanos), None));
         assert_eq!(datum, Some(Datum::timestamp_nanos(ts_nanos)));
 
+        // Test TimestampNanosecond with timezone - maps to Datum::timestamptz_nanos
+        let datum = super::scalar_value_to_datum(&ScalarValue::TimestampNanosecond(
+            Some(ts_nanos),
+            Some("+00:00".into()),
+        ));
+        assert_eq!(datum, Some(Datum::timestamptz_nanos(ts_nanos)));
+
         // Test None timestamp
         let datum = super::scalar_value_to_datum(&ScalarValue::TimestampMicrosecond(None, None));
         assert_eq!(datum, None);
 
-        // Note: TimestampSecond and TimestampMillisecond are not supported because
-        // DataFusion's type coercion converts them to TimestampMicrosecond or TimestampNanosecond
-        // before they reach scalar_value_to_datum in SQL queries.
-        //
-        // These return None (not pushed down):
+        // TimestampSecond and TimestampMillisecond are also supported
         let ts_seconds = 1672876800i64; // 2023-01-05 00:00:00 UTC in seconds
         let datum =
             super::scalar_value_to_datum(&ScalarValue::TimestampSecond(Some(ts_seconds), None));
-        assert_eq!(datum, None);
+        assert_eq!(
+            datum,
+            Some(Datum::timestamp_micros(ts_seconds * 1_000_000))
+        );
 
         let ts_millis = 1672876800000i64; // 2023-01-05 00:00:00 UTC in milliseconds
         let datum =
             super::scalar_value_to_datum(&ScalarValue::TimestampMillisecond(Some(ts_millis), None));
-        assert_eq!(datum, None);
+        assert_eq!(datum, Some(Datum::timestamp_micros(ts_millis * 1_000)));
     }
 
     #[test]

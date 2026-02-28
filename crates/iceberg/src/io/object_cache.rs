@@ -73,6 +73,16 @@ impl ObjectCache {
         }
     }
 
+    /// Creates a new [`ObjectCache`] that shares the moka cache from `source`.
+    /// Cache hits return shared entries; misses are loaded via the given `file_io`.
+    pub(crate) fn with_shared_cache(file_io: FileIO, source: &ObjectCache) -> Self {
+        Self {
+            cache: source.cache.clone(),
+            file_io,
+            cache_disabled: source.cache_disabled,
+        }
+    }
+
     /// Creates a new [`ObjectCache`]
     /// with caching disabled
     pub(crate) fn with_disabled_cache(file_io: FileIO) -> Self {

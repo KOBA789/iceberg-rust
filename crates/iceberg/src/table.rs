@@ -174,6 +174,16 @@ impl Table {
         self
     }
 
+    /// Returns a new Table that shares the moka manifest cache from `source`.
+    /// Cached manifests are reused; new manifests are loaded via this Table's FileIO.
+    pub fn with_shared_cache(mut self, source: &Table) -> Self {
+        self.object_cache = Arc::new(ObjectCache::with_shared_cache(
+            self.file_io.clone(),
+            &source.object_cache,
+        ));
+        self
+    }
+
     /// Returns a TableBuilder to build a table
     pub fn builder() -> TableBuilder {
         TableBuilder::new()

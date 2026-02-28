@@ -201,7 +201,18 @@ impl S3TablesCatalog {
             .table_bucket_arn(self.config.table_bucket_arn.clone())
             .namespace(table_ident.namespace().to_url_string())
             .name(table_ident.name());
-        let resp: GetTableOutput = req.send().await.map_err(from_aws_sdk_error)?;
+        let resp: GetTableOutput = match req.send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                if err.as_service_error().map(|e| e.is_not_found_exception()) == Some(true) {
+                    return Err(Error::new(
+                        ErrorKind::TableNotFound,
+                        format!("Table {table_ident} is not found"),
+                    ));
+                }
+                return Err(from_aws_sdk_error(err));
+            }
+        };
 
         // when a table is created, it's possible that the metadata location is not set.
         let metadata_location = resp.metadata_location().ok_or_else(|| {
@@ -507,6 +518,7 @@ impl Catalog for S3TablesCatalog {
     /// `Table` object with the retrieved metadata.
     ///
     /// This function can return an error in the following situations:
+    /// - If the table does not exist, identified by the `TableNotFound` variant.
     /// - If the table does not have a metadata location, identified by a specific
     /// `Unexpected` variant.
     /// - Errors from the underlying database query process, converted using

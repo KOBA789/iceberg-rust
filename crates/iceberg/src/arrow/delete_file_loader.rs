@@ -67,6 +67,7 @@ impl BasicDeleteFileLoader {
             None,
             None,
             file_size_in_bytes,
+            None,
         )
         .await?
         .build()?

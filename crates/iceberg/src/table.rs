@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use crate::arrow::ArrowReaderBuilder;
+use crate::arrow::parquet_read_cache::ParquetReadCache;
 use crate::inspect::MetadataTable;
 use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
@@ -146,6 +147,7 @@ impl TableBuilder {
             identifier,
             readonly,
             object_cache,
+            parquet_read_cache: None,
         })
     }
 }
@@ -159,6 +161,7 @@ pub struct Table {
     identifier: TableIdent,
     readonly: bool,
     object_cache: Arc<ObjectCache>,
+    parquet_read_cache: Option<ParquetReadCache>,
 }
 
 impl Table {
@@ -174,13 +177,16 @@ impl Table {
         self
     }
 
-    /// Returns a new Table that shares the moka manifest cache from `source`.
-    /// Cached manifests are reused; new manifests are loaded via this Table's FileIO.
+    /// Returns a new Table that shares the moka manifest cache and Parquet read
+    /// cache from `source`.
+    /// Cached manifests and byte ranges are reused; new entries are loaded via
+    /// this Table's FileIO.
     pub fn with_shared_cache(mut self, source: &Table) -> Self {
         self.object_cache = Arc::new(ObjectCache::with_shared_cache(
             self.file_io.clone(),
             &source.object_cache,
         ));
+        self.parquet_read_cache = source.parquet_read_cache.clone();
         self
     }
 
@@ -227,6 +233,17 @@ impl Table {
     /// Returns this table's object cache
     pub(crate) fn object_cache(&self) -> Arc<ObjectCache> {
         self.object_cache.clone()
+    }
+
+    /// Sets the Parquet byte-range read cache for this table.
+    pub fn with_parquet_read_cache(mut self, cache: ParquetReadCache) -> Self {
+        self.parquet_read_cache = Some(cache);
+        self
+    }
+
+    /// Returns this table's Parquet read cache, if set.
+    pub fn parquet_read_cache(&self) -> Option<&ParquetReadCache> {
+        self.parquet_read_cache.as_ref()
     }
 
     /// Creates a table scan.

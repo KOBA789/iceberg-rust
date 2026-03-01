@@ -45,6 +45,7 @@ use parquet::file::metadata::{
 use parquet::schema::types::{SchemaDescriptor, Type as ParquetType};
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::parquet_read_cache::ParquetReadCache;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::{arrow_schema_to_schema, get_arrow_datum};
 use crate::delete_vector::DeleteVector;
@@ -68,6 +69,7 @@ pub struct ArrowReaderBuilder {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     metadata_size_hint: Option<usize>,
+    parquet_read_cache: Option<ParquetReadCache>,
 }
 
 impl ArrowReaderBuilder {
@@ -82,6 +84,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             metadata_size_hint: None,
+            parquet_read_cache: None,
         }
     }
 
@@ -119,6 +122,12 @@ impl ArrowReaderBuilder {
         self
     }
 
+    /// Sets the Parquet byte-range read cache.
+    pub fn with_parquet_read_cache(mut self, cache: ParquetReadCache) -> Self {
+        self.parquet_read_cache = Some(cache);
+        self
+    }
+
     /// Build the ArrowReader.
     pub fn build(self) -> ArrowReader {
         ArrowReader {
@@ -132,6 +141,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             metadata_size_hint: self.metadata_size_hint,
+            parquet_read_cache: self.parquet_read_cache,
         }
     }
 }
@@ -149,6 +159,7 @@ pub struct ArrowReader {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     metadata_size_hint: Option<usize>,
+    parquet_read_cache: Option<ParquetReadCache>,
 }
 
 impl ArrowReader {
@@ -161,6 +172,7 @@ impl ArrowReader {
         let row_group_filtering_enabled = self.row_group_filtering_enabled;
         let row_selection_enabled = self.row_selection_enabled;
         let metadata_size_hint = self.metadata_size_hint;
+        let parquet_read_cache = self.parquet_read_cache.clone();
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
         let stream: ArrowRecordBatchStream = if concurrency_limit_data_files == 1 {
@@ -168,6 +180,7 @@ impl ArrowReader {
                 tasks
                     .and_then(move |task| {
                         let file_io = file_io.clone();
+                        let parquet_read_cache = parquet_read_cache.clone();
 
                         Self::process_file_scan_task(
                             task,
@@ -177,6 +190,7 @@ impl ArrowReader {
                             row_group_filtering_enabled,
                             row_selection_enabled,
                             metadata_size_hint,
+                            parquet_read_cache,
                         )
                     })
                     .map_err(|err| {
@@ -190,6 +204,7 @@ impl ArrowReader {
                 tasks
                     .map_ok(move |task| {
                         let file_io = file_io.clone();
+                        let parquet_read_cache = parquet_read_cache.clone();
 
                         Self::process_file_scan_task(
                             task,
@@ -199,6 +214,7 @@ impl ArrowReader {
                             row_group_filtering_enabled,
                             row_selection_enabled,
                             metadata_size_hint,
+                            parquet_read_cache,
                         )
                     })
                     .map_err(|err| {
@@ -222,6 +238,7 @@ impl ArrowReader {
         row_group_filtering_enabled: bool,
         row_selection_enabled: bool,
         metadata_size_hint: Option<usize>,
+        parquet_read_cache: Option<ParquetReadCache>,
     ) -> Result<ArrowRecordBatchStream> {
         let should_load_page_index =
             (row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
@@ -238,6 +255,7 @@ impl ArrowReader {
             None,
             metadata_size_hint,
             task.file_size_in_bytes,
+            parquet_read_cache.as_ref(),
         )
         .await?;
 
@@ -292,6 +310,7 @@ impl ArrowReader {
                 Some(options),
                 metadata_size_hint,
                 task.file_size_in_bytes,
+                parquet_read_cache.as_ref(),
             )
             .await?
         } else {
@@ -497,16 +516,27 @@ impl ArrowReader {
         arrow_reader_options: Option<ArrowReaderOptions>,
         metadata_size_hint: Option<usize>,
         file_size_in_bytes: u64,
+        parquet_read_cache: Option<&ParquetReadCache>,
     ) -> Result<ParquetRecordBatchStreamBuilder<ArrowFileReader>> {
         // Get the metadata for the Parquet file we need to read and build
         // a reader for the data within
         let parquet_file = file_io.new_input(data_file_path)?;
         let parquet_reader = parquet_file.reader().await?;
+
+        // Always wrap with CachedFileRead. When parquet_read_cache is None,
+        // reads pass through directly to the inner reader.
+        let cached_reader =
+            crate::arrow::parquet_read_cache::CachedFileRead::new(
+                parquet_reader,
+                Arc::from(data_file_path),
+                file_size_in_bytes,
+                parquet_read_cache.cloned(),
+            );
         let mut parquet_file_reader = ArrowFileReader::new(
             FileMetadata {
                 size: file_size_in_bytes,
             },
-            parquet_reader,
+            Box::new(cached_reader),
         )
         .with_preload_column_index(true)
         .with_preload_offset_index(true)

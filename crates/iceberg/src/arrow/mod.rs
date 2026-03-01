@@ -27,6 +27,9 @@ pub(crate) mod caching_delete_file_loader;
 pub mod delete_file_loader;
 pub(crate) mod delete_filter;
 
+/// Byte-range cache for Parquet DataFile reads.
+pub mod parquet_read_cache;
+
 mod reader;
 /// RecordBatch projection utilities
 pub mod record_batch_projector;

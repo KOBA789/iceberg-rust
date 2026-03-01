@@ -68,6 +68,8 @@ impl BasicDeleteFileLoader {
             None,
             file_size_in_bytes,
             None,
+            super::reader::DEFAULT_RANGE_COALESCE_BYTES,
+            super::reader::DEFAULT_RANGE_FETCH_CONCURRENCY,
         )
         .await?
         .build()?

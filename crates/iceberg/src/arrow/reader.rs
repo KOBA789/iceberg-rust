@@ -70,6 +70,8 @@ pub struct ArrowReaderBuilder {
     row_selection_enabled: bool,
     metadata_size_hint: Option<usize>,
     parquet_read_cache: Option<ParquetReadCache>,
+    range_coalesce_bytes: u64,
+    range_fetch_concurrency: usize,
 }
 
 impl ArrowReaderBuilder {
@@ -85,6 +87,8 @@ impl ArrowReaderBuilder {
             row_selection_enabled: false,
             metadata_size_hint: None,
             parquet_read_cache: None,
+            range_coalesce_bytes: DEFAULT_RANGE_COALESCE_BYTES,
+            range_fetch_concurrency: DEFAULT_RANGE_FETCH_CONCURRENCY,
         }
     }
 
@@ -128,6 +132,20 @@ impl ArrowReaderBuilder {
         self
     }
 
+    /// Set the maximum gap (in bytes) between byte ranges that will be coalesced
+    /// into a single read request. Default: 1 MB.
+    pub fn with_range_coalesce_bytes(mut self, bytes: u64) -> Self {
+        self.range_coalesce_bytes = bytes;
+        self
+    }
+
+    /// Set the maximum number of coalesced ranges to fetch concurrently.
+    /// Default: 10.
+    pub fn with_range_fetch_concurrency(mut self, concurrency: usize) -> Self {
+        self.range_fetch_concurrency = concurrency;
+        self
+    }
+
     /// Build the ArrowReader.
     pub fn build(self) -> ArrowReader {
         ArrowReader {
@@ -142,6 +160,8 @@ impl ArrowReaderBuilder {
             row_selection_enabled: self.row_selection_enabled,
             metadata_size_hint: self.metadata_size_hint,
             parquet_read_cache: self.parquet_read_cache,
+            range_coalesce_bytes: self.range_coalesce_bytes,
+            range_fetch_concurrency: self.range_fetch_concurrency,
         }
     }
 }
@@ -160,6 +180,8 @@ pub struct ArrowReader {
     row_selection_enabled: bool,
     metadata_size_hint: Option<usize>,
     parquet_read_cache: Option<ParquetReadCache>,
+    range_coalesce_bytes: u64,
+    range_fetch_concurrency: usize,
 }
 
 impl ArrowReader {
@@ -173,6 +195,8 @@ impl ArrowReader {
         let row_selection_enabled = self.row_selection_enabled;
         let metadata_size_hint = self.metadata_size_hint;
         let parquet_read_cache = self.parquet_read_cache.clone();
+        let range_coalesce_bytes = self.range_coalesce_bytes;
+        let range_fetch_concurrency = self.range_fetch_concurrency;
 
         // Fast-path for single concurrency to avoid overhead of try_flatten_unordered
         let stream: ArrowRecordBatchStream = if concurrency_limit_data_files == 1 {
@@ -191,6 +215,8 @@ impl ArrowReader {
                             row_selection_enabled,
                             metadata_size_hint,
                             parquet_read_cache,
+                            range_coalesce_bytes,
+                            range_fetch_concurrency,
                         )
                     })
                     .map_err(|err| {
@@ -215,6 +241,8 @@ impl ArrowReader {
                             row_selection_enabled,
                             metadata_size_hint,
                             parquet_read_cache,
+                            range_coalesce_bytes,
+                            range_fetch_concurrency,
                         )
                     })
                     .map_err(|err| {
@@ -239,6 +267,8 @@ impl ArrowReader {
         row_selection_enabled: bool,
         metadata_size_hint: Option<usize>,
         parquet_read_cache: Option<ParquetReadCache>,
+        range_coalesce_bytes: u64,
+        range_fetch_concurrency: usize,
     ) -> Result<ArrowRecordBatchStream> {
         let should_load_page_index =
             (row_selection_enabled && task.predicate.is_some()) || !task.deletes.is_empty();
@@ -256,6 +286,8 @@ impl ArrowReader {
             metadata_size_hint,
             task.file_size_in_bytes,
             parquet_read_cache.as_ref(),
+            range_coalesce_bytes,
+            range_fetch_concurrency,
         )
         .await?;
 
@@ -311,6 +343,8 @@ impl ArrowReader {
                 metadata_size_hint,
                 task.file_size_in_bytes,
                 parquet_read_cache.as_ref(),
+                range_coalesce_bytes,
+                range_fetch_concurrency,
             )
             .await?
         } else {
@@ -517,6 +551,8 @@ impl ArrowReader {
         metadata_size_hint: Option<usize>,
         file_size_in_bytes: u64,
         parquet_read_cache: Option<&ParquetReadCache>,
+        range_coalesce_bytes: u64,
+        range_fetch_concurrency: usize,
     ) -> Result<ParquetRecordBatchStreamBuilder<ArrowFileReader>> {
         // Get the metadata for the Parquet file we need to read and build
         // a reader for the data within
@@ -540,7 +576,9 @@ impl ArrowReader {
         )
         .with_preload_column_index(true)
         .with_preload_offset_index(true)
-        .with_preload_page_index(should_load_page_index);
+        .with_preload_page_index(should_load_page_index)
+        .with_range_coalesce_bytes(range_coalesce_bytes)
+        .with_range_fetch_concurrency(range_fetch_concurrency);
 
         if let Some(hint) = metadata_size_hint {
             parquet_file_reader = parquet_file_reader.with_metadata_size_hint(hint);
@@ -1733,6 +1771,43 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
     }
 }
 
+/// Default maximum gap (in bytes) between byte ranges that will be coalesced
+/// into a single read request.
+pub(crate) const DEFAULT_RANGE_COALESCE_BYTES: u64 = 1_048_576;
+
+/// Default maximum number of coalesced ranges to fetch concurrently.
+pub(crate) const DEFAULT_RANGE_FETCH_CONCURRENCY: usize = 10;
+
+/// Merge byte ranges that are within `coalesce` bytes of each other.
+///
+/// Returns a sorted list of merged ranges. Adjacent or overlapping ranges whose
+/// gap is `<= coalesce` are combined into a single range, reducing the number of
+/// I/O requests at the cost of reading some extra bytes.
+fn merge_ranges(ranges: &[Range<u64>], coalesce: u64) -> Vec<Range<u64>> {
+    if ranges.is_empty() {
+        return Vec::new();
+    }
+
+    let mut sorted: Vec<Range<u64>> = ranges.to_vec();
+    sorted.sort_unstable_by_key(|r| r.start);
+
+    let mut merged: Vec<Range<u64>> = Vec::with_capacity(sorted.len());
+    merged.push(sorted[0].clone());
+
+    for range in &sorted[1..] {
+        let last = merged.last_mut().unwrap();
+        // If the gap between the end of the last merged range and the start of
+        // the current range is within the coalesce threshold, merge them.
+        if range.start <= last.end.saturating_add(coalesce) {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range.clone());
+        }
+    }
+
+    merged
+}
+
 /// ArrowFileReader is a wrapper around a FileRead that impls parquets AsyncFileReader.
 pub struct ArrowFileReader {
     meta: FileMetadata,
@@ -1740,6 +1815,8 @@ pub struct ArrowFileReader {
     preload_offset_index: bool,
     preload_page_index: bool,
     metadata_size_hint: Option<usize>,
+    range_coalesce_bytes: u64,
+    range_fetch_concurrency: usize,
     r: Box<dyn FileRead>,
 }
 
@@ -1752,6 +1829,8 @@ impl ArrowFileReader {
             preload_offset_index: false,
             preload_page_index: false,
             metadata_size_hint: None,
+            range_coalesce_bytes: DEFAULT_RANGE_COALESCE_BYTES,
+            range_fetch_concurrency: DEFAULT_RANGE_FETCH_CONCURRENCY,
             r,
         }
     }
@@ -1782,6 +1861,20 @@ impl ArrowFileReader {
         self.metadata_size_hint = Some(hint);
         self
     }
+
+    /// Set the maximum gap (in bytes) between byte ranges that will be coalesced
+    /// into a single read request. Default: 1 MB.
+    pub fn with_range_coalesce_bytes(mut self, bytes: u64) -> Self {
+        self.range_coalesce_bytes = bytes;
+        self
+    }
+
+    /// Set the maximum number of coalesced ranges to fetch concurrently.
+    /// Default: 10.
+    pub fn with_range_fetch_concurrency(mut self, concurrency: usize) -> Self {
+        self.range_fetch_concurrency = concurrency;
+        self
+    }
 }
 
 impl AsyncFileReader for ArrowFileReader {
@@ -1791,6 +1884,48 @@ impl AsyncFileReader for ArrowFileReader {
                 .read(range.start..range.end)
                 .map_err(|err| parquet::errors::ParquetError::External(Box::new(err))),
         )
+    }
+
+    fn get_byte_ranges(
+        &mut self,
+        ranges: Vec<Range<u64>>,
+    ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>> {
+        let coalesce_bytes = self.range_coalesce_bytes;
+        // buffered(0) never polls futures, so clamp to at least 1.
+        let concurrency = self.range_fetch_concurrency.max(1);
+
+        async move {
+            let fetch_ranges = merge_ranges(&ranges, coalesce_bytes);
+
+            let fetched: Vec<Bytes> = futures::stream::iter(fetch_ranges.iter().cloned())
+                .map(|range| {
+                    let r = &self.r;
+                    async move {
+                        r.read(range)
+                            .await
+                            .map_err(|e| parquet::errors::ParquetError::External(Box::new(e)))
+                    }
+                })
+                .buffered(concurrency)
+                .try_collect()
+                .await?;
+
+            Ok(ranges
+                .iter()
+                .map(|range| {
+                    let upper = fetch_ranges.partition_point(|v| v.start <= range.start);
+                    // Safety: merge_ranges guarantees every input range is contained
+                    // within exactly one merged range, so upper >= 1.
+                    let idx = upper - 1;
+                    let fetch_range = &fetch_ranges[idx];
+                    let fetch_bytes = &fetched[idx];
+                    let start = (range.start - fetch_range.start) as usize;
+                    let end = (range.end - fetch_range.start) as usize;
+                    fetch_bytes.slice(start..end)
+                })
+                .collect())
+        }
+        .boxed()
     }
 
     // TODO: currently we don't respect `ArrowReaderOptions` cause it don't expose any method to access the option field
@@ -4346,5 +4481,229 @@ message schema {
         assert_eq!(name_col.value(1), "Bob");
         assert_eq!(name_col.value(2), "Charlie");
         assert_eq!(name_col.value(3), "Dave");
+    }
+
+    mod get_byte_ranges_tests {
+        use std::ops::Range;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use bytes::Bytes;
+        use parquet::arrow::async_reader::AsyncFileReader;
+
+        use crate::arrow::reader::ArrowFileReader;
+        use crate::io::{FileMetadata, FileRead};
+
+        /// Mock FileRead that records each read call's range and counts invocations.
+        struct MockFileRead {
+            call_count: Arc<AtomicUsize>,
+            data: Bytes,
+        }
+
+        impl MockFileRead {
+            fn new(data: &[u8]) -> Self {
+                Self {
+                    call_count: Arc::new(AtomicUsize::new(0)),
+                    data: Bytes::copy_from_slice(data),
+                }
+            }
+
+            fn call_count(&self) -> usize {
+                self.call_count.load(Ordering::SeqCst)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl FileRead for MockFileRead {
+            async fn read(&self, range: Range<u64>) -> crate::Result<Bytes> {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+                let start = range.start as usize;
+                let end = (range.end as usize).min(self.data.len());
+                Ok(self.data.slice(start..end))
+            }
+        }
+
+        fn make_reader(
+            data: &[u8],
+            coalesce: u64,
+            concurrency: usize,
+        ) -> (ArrowFileReader, Arc<AtomicUsize>) {
+            let mock = MockFileRead::new(data);
+            let call_count = mock.call_count.clone();
+            let meta = FileMetadata {
+                size: data.len() as u64,
+            };
+            let reader = ArrowFileReader::new(meta, Box::new(mock))
+                .with_range_coalesce_bytes(coalesce)
+                .with_range_fetch_concurrency(concurrency);
+            (reader, call_count)
+        }
+
+        #[tokio::test]
+        async fn adjacent_ranges_coalesce_into_one_read() {
+            // 30 bytes of test data
+            let data: Vec<u8> = (0u8..30).collect();
+            let (mut reader, call_count) = make_reader(&data, 100, 10);
+
+            let ranges = vec![0..10, 10..20, 20..30];
+            let result = reader.get_byte_ranges(ranges).await.unwrap();
+
+            assert_eq!(result.len(), 3);
+            assert_eq!(result[0].as_ref(), &data[0..10]);
+            assert_eq!(result[1].as_ref(), &data[10..20]);
+            assert_eq!(result[2].as_ref(), &data[20..30]);
+            // All three ranges should merge into one read
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn disjoint_groups_produce_separate_reads() {
+            // Two groups far apart
+            let data: Vec<u8> = (0u8..=255).cycle().take(500).collect();
+            let (mut reader, call_count) = make_reader(&data, 10, 10);
+
+            // Group 1: 0..10, 15..25 (gap=5, within coalesce=10)
+            // Group 2: 400..420 (gap=375, beyond coalesce)
+            let ranges = vec![0..10, 15..25, 400..420];
+            let result = reader.get_byte_ranges(ranges).await.unwrap();
+
+            assert_eq!(result.len(), 3);
+            assert_eq!(result[0].as_ref(), &data[0..10]);
+            assert_eq!(result[1].as_ref(), &data[15..25]);
+            assert_eq!(result[2].as_ref(), &data[400..420]);
+            // Two coalesced groups → 2 inner reads
+            assert_eq!(call_count.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn unsorted_input_returns_in_input_order() {
+            let data: Vec<u8> = (0u8..50).collect();
+            let (mut reader, _call_count) = make_reader(&data, 0, 10);
+
+            // Provide ranges out of order
+            let ranges = vec![30..40, 0..10, 20..30];
+            let result = reader.get_byte_ranges(ranges).await.unwrap();
+
+            assert_eq!(result.len(), 3);
+            // Results should match input order, not sorted order
+            assert_eq!(result[0].as_ref(), &data[30..40]);
+            assert_eq!(result[1].as_ref(), &data[0..10]);
+            assert_eq!(result[2].as_ref(), &data[20..30]);
+        }
+
+        #[tokio::test]
+        async fn single_range_produces_one_read() {
+            let data: Vec<u8> = (0u8..100).collect();
+            let (mut reader, call_count) = make_reader(&data, 1024, 10);
+
+            #[allow(clippy::single_range_in_vec_init)]
+            let ranges = vec![10..50];
+            let result = reader.get_byte_ranges(ranges).await.unwrap();
+
+            assert_eq!(result.len(), 1);
+            assert_eq!(result[0].as_ref(), &data[10..50]);
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn empty_ranges_produces_no_reads() {
+            let data: Vec<u8> = (0u8..100).collect();
+            let (mut reader, call_count) = make_reader(&data, 1024, 10);
+
+            let ranges: Vec<Range<u64>> = vec![];
+            let result = reader.get_byte_ranges(ranges).await.unwrap();
+
+            assert!(result.is_empty());
+            assert_eq!(call_count.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn zero_concurrency_still_works() {
+            // concurrency=0 is clamped to 1 internally to avoid stalling
+            let data: Vec<u8> = (0u8..30).collect();
+            let (mut reader, _call_count) = make_reader(&data, 100, 0);
+
+            let ranges = vec![0..10, 10..20, 20..30];
+            let result = reader.get_byte_ranges(ranges).await.unwrap();
+
+            assert_eq!(result.len(), 3);
+            assert_eq!(result[0].as_ref(), &data[0..10]);
+            assert_eq!(result[1].as_ref(), &data[10..20]);
+            assert_eq!(result[2].as_ref(), &data[20..30]);
+        }
+    }
+
+    mod merge_ranges_tests {
+        use super::super::merge_ranges;
+
+        #[test]
+        fn empty_input() {
+            assert_eq!(merge_ranges(&[], 1024), Vec::<std::ops::Range<u64>>::new());
+        }
+
+        #[test]
+        #[allow(clippy::single_range_in_vec_init)]
+        fn single_range() {
+            assert_eq!(merge_ranges(&[10..20], 1024), vec![10..20]);
+        }
+
+        #[test]
+        fn disjoint_ranges_no_merge() {
+            // Gap of 100 > coalesce of 10
+            assert_eq!(merge_ranges(&[0..10, 110..120], 10), vec![0..10, 110..120]);
+        }
+
+        #[test]
+        fn gap_within_threshold_merges() {
+            // Gap of 10 <= coalesce of 100
+            assert_eq!(merge_ranges(&[0..10, 20..30], 100), vec![0..30]);
+        }
+
+        #[test]
+        fn overlapping_ranges_merge() {
+            assert_eq!(merge_ranges(&[0..20, 10..30], 0), vec![0..30]);
+        }
+
+        #[test]
+        fn unsorted_input() {
+            assert_eq!(merge_ranges(&[100..200, 0..50, 50..100], 0), vec![0..200]);
+        }
+
+        #[test]
+        fn gap_boundary_exact_coalesce_merges() {
+            // Range 0..10 and 20..30 have gap of 10. Coalesce = 10 → merge
+            assert_eq!(merge_ranges(&[0..10, 20..30], 10), vec![0..30]);
+        }
+
+        #[test]
+        fn gap_boundary_coalesce_minus_one_no_merge() {
+            // Range 0..10 and 20..30 have gap of 10. Coalesce = 9 → no merge
+            assert_eq!(merge_ranges(&[0..10, 20..30], 9), vec![0..10, 20..30]);
+        }
+
+        #[test]
+        fn multiple_groups() {
+            // Three groups: [0..10, 15..25] merge with coalesce=10,
+            // [100..110] standalone, [200..210, 215..225] merge
+            assert_eq!(
+                merge_ranges(&[200..210, 0..10, 100..110, 15..25, 215..225], 10),
+                vec![0..25, 100..110, 200..225]
+            );
+        }
+
+        #[test]
+        fn adjacent_ranges_merge_with_zero_coalesce() {
+            // Ranges touching at boundary: 0..10 and 10..20 have gap=0 <= coalesce=0
+            assert_eq!(merge_ranges(&[0..10, 10..20], 0), vec![0..20]);
+        }
+
+        #[test]
+        fn near_u64_max_no_overflow() {
+            // Ensure saturating_add prevents overflow when coalesce is large
+            let max = u64::MAX;
+            let ranges = vec![(max - 20)..(max - 10), (max - 5)..max];
+            // gap = (max - 5) - (max - 10) = 5, coalesce = u64::MAX → merge
+            assert_eq!(merge_ranges(&ranges, u64::MAX), vec![(max - 20)..max]);
+        }
     }
 }

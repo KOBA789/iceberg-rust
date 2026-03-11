@@ -33,7 +33,7 @@ use iceberg::{
     TableCommit, TableCreation, TableIdent,
 };
 
-use crate::utils::create_sdk_config;
+use crate::utils::{create_sdk_config, sdk_credential_loader};
 
 /// S3Tables table bucket ARN property
 pub const S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN: &str = "table_bucket_arn";
@@ -54,6 +54,8 @@ struct S3TablesCatalogConfig {
     endpoint_url: Option<String>,
     /// Optional pre-configured AWS SDK client for S3Tables.
     client: Option<aws_sdk_s3tables::Client>,
+    /// Optional pre-built AWS SDK config for credential bridging.
+    sdk_config: Option<aws_config::SdkConfig>,
     /// Properties for the catalog. The available properties are:
     /// - `profile_name`: The name of the AWS profile to use.
     /// - `region_name`: The AWS region to use.
@@ -75,6 +77,7 @@ impl Default for S3TablesCatalogBuilder {
             table_bucket_arn: "".to_string(),
             endpoint_url: None,
             client: None,
+            sdk_config: None,
             props: HashMap::new(),
         })
     }
@@ -96,8 +99,26 @@ impl S3TablesCatalogBuilder {
     }
 
     /// Configure the catalog with a pre-built AWS SDK client.
+    ///
+    /// If used without [`with_sdk_config`](Self::with_sdk_config), the FileIO
+    /// credential bridge is not installed and FileIO falls back to props-based
+    /// or environment-based credentials.
     pub fn with_client(mut self, client: aws_sdk_s3tables::Client) -> Self {
         self.0.client = Some(client);
+        self
+    }
+
+    /// Configure the catalog with a pre-built AWS SDK config.
+    ///
+    /// The SDK config provides the credential provider for the FileIO layer,
+    /// enabling SSO, credential_process, and IAM role support.
+    ///
+    /// When used with [`with_client`](Self::with_client), the client is used as-is
+    /// and the SDK config provides only the credential bridge for FileIO.
+    /// When used without `with_client`, the SDK config is also used to construct
+    /// the S3Tables client.
+    pub fn with_sdk_config(mut self, sdk_config: aws_config::SdkConfig) -> Self {
+        self.0.sdk_config = Some(sdk_config);
         self
     }
 
@@ -174,15 +195,30 @@ pub struct S3TablesCatalog {
 
 impl S3TablesCatalog {
     /// Creates a new S3Tables catalog.
-    async fn new(config: S3TablesCatalogConfig) -> Result<Self> {
+    async fn new(mut config: S3TablesCatalogConfig) -> Result<Self> {
+        let sdk_config = if let Some(sc) = config.sdk_config.take() {
+            Some(sc)
+        } else if config.client.is_none() {
+            Some(create_sdk_config(&config.props, config.endpoint_url.clone()).await)
+        } else {
+            None
+        };
+
         let s3tables_client = if let Some(client) = config.client.clone() {
             client
         } else {
-            let aws_config = create_sdk_config(&config.props, config.endpoint_url.clone()).await;
-            aws_sdk_s3tables::Client::new(&aws_config)
+            aws_sdk_s3tables::Client::new(
+                sdk_config
+                    .as_ref()
+                    .expect("sdk_config must exist when client is not provided"),
+            )
         };
 
-        let file_io = FileIOBuilder::new("s3").with_props(&config.props).build()?;
+        let mut file_io_builder = FileIOBuilder::new("s3").with_props(&config.props);
+        if let Some(loader) = sdk_config.as_ref().and_then(sdk_credential_loader) {
+            file_io_builder = file_io_builder.with_extension(loader);
+        }
+        let file_io = file_io_builder.build()?;
 
         Ok(Self {
             config,
@@ -712,6 +748,7 @@ mod tests {
             table_bucket_arn,
             endpoint_url: None,
             client: None,
+            sdk_config: None,
             props: HashMap::new(),
         };
 

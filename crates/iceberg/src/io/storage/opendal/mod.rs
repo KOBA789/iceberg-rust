@@ -36,7 +36,7 @@ use opendal::services::OssConfig;
 use opendal::services::S3Config;
 use opendal::{Operator, Scheme};
 #[cfg(feature = "storage-s3")]
-pub use s3::CustomAwsCredentialLoader;
+pub use s3::{AwsCredential, AwsCredentialLoad, CustomAwsCredentialLoader};
 use serde::{Deserialize, Serialize};
 
 use crate::io::{

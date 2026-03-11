@@ -16,9 +16,12 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use async_trait::async_trait;
 use aws_config::{BehaviorVersion, Region, SdkConfig};
-use aws_sdk_s3tables::config::Credentials;
+use aws_sdk_s3tables::config::{Credentials, ProvideCredentials, SharedCredentialsProvider};
+use iceberg::io::{AwsCredential, AwsCredentialLoad, CustomAwsCredentialLoader};
 
 /// Property aws profile name
 pub const AWS_PROFILE_NAME: &str = "profile_name";
@@ -39,12 +42,12 @@ pub(crate) async fn create_sdk_config(
 ) -> SdkConfig {
     let mut config = aws_config::defaults(BehaviorVersion::latest());
 
-    if properties.is_empty() {
-        return config.load().await;
-    }
-
     if let Some(endpoint_url) = endpoint_url {
         config = config.endpoint_url(endpoint_url);
+    }
+
+    if properties.is_empty() {
+        return config.load().await;
     }
 
     if let (Some(access_key), Some(secret_key)) = (
@@ -68,4 +71,36 @@ pub(crate) async fn create_sdk_config(
     }
 
     config.load().await
+}
+
+/// Bridges AWS SDK credential providers into reqsign's `AwsCredentialLoad`,
+/// so that FileIO (OpenDAL) can use the full AWS credential chain
+/// including SSO, credential_process, and IAM roles.
+#[derive(Debug, Clone)]
+struct AwsSdkCredentialBridge {
+    provider: SharedCredentialsProvider,
+}
+
+#[async_trait]
+impl AwsCredentialLoad for AwsSdkCredentialBridge {
+    async fn load_credential(
+        &self,
+        _client: reqwest::Client,
+    ) -> anyhow::Result<Option<AwsCredential>> {
+        let creds = self.provider.provide_credentials().await?;
+        Ok(Some(AwsCredential {
+            access_key_id: creds.access_key_id().to_string(),
+            secret_access_key: creds.secret_access_key().to_string(),
+            session_token: creds.session_token().map(ToOwned::to_owned),
+            expires_in: creds.expiry().map(Into::into),
+        }))
+    }
+}
+
+/// Extracts the credential provider from an `SdkConfig` and wraps it
+/// as a `CustomAwsCredentialLoader` for use with `FileIOBuilder`.
+pub(crate) fn sdk_credential_loader(sdk_config: &SdkConfig) -> Option<CustomAwsCredentialLoader> {
+    sdk_config.credentials_provider().map(|provider| {
+        CustomAwsCredentialLoader::new(Arc::new(AwsSdkCredentialBridge { provider }))
+    })
 }

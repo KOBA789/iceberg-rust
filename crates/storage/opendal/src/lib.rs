@@ -39,7 +39,7 @@ use iceberg::io::{
 };
 use iceberg::{Error, ErrorKind, Result};
 use opendal::Operator;
-use opendal::layers::{RetryLayer, TimeoutLayer};
+use opendal::layers::{RetryLayer, TimeoutLayer, TracingLayer};
 use serde::{Deserialize, Serialize};
 use utils::from_opendal_error;
 
@@ -365,7 +365,10 @@ impl OpenDalStorage {
         // Transient errors are common for object stores; we retry temporary
         // failures with exponential backoff. The retry behavior also
         // benefits non-object-store backends.
-        let operator = operator.layer(TimeoutLayer::new()).layer(RetryLayer::new());
+        let operator = operator
+            .layer(TimeoutLayer::new())
+            .layer(RetryLayer::new())
+            .layer(TracingLayer::default());
         Ok((operator, relative_path))
     }
 

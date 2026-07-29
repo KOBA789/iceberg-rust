@@ -215,6 +215,33 @@ impl Transaction {
             .build())
     }
 
+    /// Prepare this transaction as a [`TableCommit`] without sending it to a catalog.
+    ///
+    /// This is useful when the caller needs to coordinate the catalog commit with
+    /// another operation. Unlike [`Self::commit`], this method does not refresh a
+    /// stale table or retry conflicts.
+    pub async fn prepare(self) -> Result<TableCommit> {
+        let mut current_table = self.table.clone();
+        let mut existing_updates = vec![];
+        let mut existing_requirements = vec![];
+
+        for action in &self.actions {
+            let action_commit = Arc::clone(action).commit(&current_table).await?;
+            current_table = Self::apply(
+                current_table,
+                action_commit,
+                &mut existing_updates,
+                &mut existing_requirements,
+            )?;
+        }
+
+        Ok(TableCommit::builder()
+            .ident(self.table.identifier().to_owned())
+            .updates(existing_updates)
+            .requirements(existing_requirements)
+            .build())
+    }
+
     async fn do_commit(&mut self, catalog: &dyn Catalog) -> Result<Table> {
         let refreshed = catalog.load_table(self.table.identifier()).await?;
 

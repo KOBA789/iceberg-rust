@@ -20,6 +20,7 @@
 use std::sync::Arc;
 
 use crate::arrow::ArrowReaderBuilder;
+use crate::arrow::parquet_read_cache::ParquetReadCache;
 use crate::encryption::EncryptionManager;
 use crate::encryption::kms::KeyManagementClient;
 use crate::inspect::MetadataTable;
@@ -188,6 +189,7 @@ impl TableBuilder {
             identifier,
             readonly,
             object_cache,
+            parquet_read_cache: None,
             runtime,
             encryption_manager,
         })
@@ -203,6 +205,7 @@ pub struct Table {
     identifier: TableIdent,
     readonly: bool,
     object_cache: Arc<ObjectCache>,
+    parquet_read_cache: Option<ParquetReadCache>,
     runtime: Runtime,
     encryption_manager: Option<Arc<EncryptionManager>>,
 }
@@ -217,6 +220,19 @@ impl Table {
     /// Sets the [`Table`] metadata location and returns an updated instance.
     pub(crate) fn with_metadata_location(mut self, metadata_location: String) -> Self {
         self.metadata_location = Some(metadata_location);
+        self
+    }
+
+    /// Returns a table that shares immutable metadata and Parquet caches with `source`.
+    ///
+    /// Cache misses continue to use this table's [`FileIO`].
+    pub fn with_shared_cache(mut self, source: &Table) -> Self {
+        self.object_cache = Arc::new(ObjectCache::with_shared_cache(
+            self.file_io.clone(),
+            &source.object_cache,
+            self.encryption_manager.clone(),
+        ));
+        self.parquet_read_cache = source.parquet_read_cache.clone();
         self
     }
 
@@ -263,6 +279,17 @@ impl Table {
     /// Returns this table's object cache
     pub(crate) fn object_cache(&self) -> Arc<ObjectCache> {
         self.object_cache.clone()
+    }
+
+    /// Sets the byte-range cache used for Parquet data files.
+    pub fn with_parquet_read_cache(mut self, cache: ParquetReadCache) -> Self {
+        self.parquet_read_cache = Some(cache);
+        self
+    }
+
+    /// Returns this table's Parquet read cache, if configured.
+    pub fn parquet_read_cache(&self) -> Option<&ParquetReadCache> {
+        self.parquet_read_cache.as_ref()
     }
 
     /// Returns the [`EncryptionManager`] for this table, if encryption is

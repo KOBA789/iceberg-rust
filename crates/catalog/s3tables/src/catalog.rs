@@ -36,7 +36,7 @@ use iceberg::{
 };
 use iceberg_storage_opendal::OpenDalStorageFactory;
 
-use crate::utils::create_sdk_config;
+use crate::utils::{create_sdk_config, sdk_credential_loader};
 
 /// S3Tables table bucket ARN property
 pub const S3TABLES_CATALOG_PROP_TABLE_BUCKET_ARN: &str = "table_bucket_arn";
@@ -57,6 +57,8 @@ struct S3TablesCatalogConfig {
     endpoint_url: Option<String>,
     /// Optional pre-configured AWS SDK client for S3Tables.
     client: Option<aws_sdk_s3tables::Client>,
+    /// Optional AWS SDK configuration used for both the client and object storage.
+    sdk_config: Option<aws_config::SdkConfig>,
     /// Properties for the catalog. The available properties are:
     /// - `profile_name`: The name of the AWS profile to use.
     /// - `region_name`: The AWS region to use.
@@ -83,6 +85,7 @@ impl Default for S3TablesCatalogBuilder {
                 table_bucket_arn: "".to_string(),
                 endpoint_url: None,
                 client: None,
+                sdk_config: None,
                 props: HashMap::new(),
             },
             storage_factory: None,
@@ -109,6 +112,16 @@ impl S3TablesCatalogBuilder {
     /// Configure the catalog with a pre-built AWS SDK client.
     pub fn with_client(mut self, client: aws_sdk_s3tables::Client) -> Self {
         self.config.client = Some(client);
+        self
+    }
+
+    /// Configure the catalog with a pre-built AWS SDK configuration.
+    ///
+    /// Its credential provider is shared with the object-storage layer, so SDK
+    /// credential sources such as IAM roles, SSO, and `credential_process` are
+    /// available for both catalog and data-file operations.
+    pub fn with_sdk_config(mut self, sdk_config: aws_config::SdkConfig) -> Self {
+        self.config.sdk_config = Some(sdk_config);
         self
     }
 
@@ -201,21 +214,32 @@ pub struct S3TablesCatalog {
 impl S3TablesCatalog {
     /// Creates a new S3Tables catalog.
     async fn new(
-        config: S3TablesCatalogConfig,
+        mut config: S3TablesCatalogConfig,
         storage_factory: Option<Arc<dyn StorageFactory>>,
         runtime: Runtime,
     ) -> Result<Self> {
+        let sdk_config = if let Some(sdk_config) = config.sdk_config.take() {
+            Some(sdk_config)
+        } else if config.client.is_none() || storage_factory.is_none() {
+            Some(create_sdk_config(&config.props, config.endpoint_url.clone()).await)
+        } else {
+            None
+        };
+
         let s3tables_client = if let Some(client) = config.client.clone() {
             client
         } else {
-            let aws_config = create_sdk_config(&config.props, config.endpoint_url.clone()).await;
-            aws_sdk_s3tables::Client::new(&aws_config)
+            aws_sdk_s3tables::Client::new(
+                sdk_config
+                    .as_ref()
+                    .expect("SDK config is available when a client is not provided"),
+            )
         };
 
         // Use provided factory or default to OpenDalStorageFactory::S3
         let factory = storage_factory.unwrap_or_else(|| {
             Arc::new(OpenDalStorageFactory::S3 {
-                customized_credential_load: None,
+                customized_credential_load: sdk_config.as_ref().and_then(sdk_credential_loader),
             })
         });
         let file_io = FileIOBuilder::new(factory)
@@ -755,6 +779,7 @@ mod tests {
             table_bucket_arn,
             endpoint_url: None,
             client: None,
+            sdk_config: None,
             props: HashMap::new(),
         };
 

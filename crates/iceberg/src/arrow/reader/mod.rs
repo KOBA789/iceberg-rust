@@ -18,6 +18,7 @@
 //! Parquet file data reader
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
+use crate::arrow::parquet_read_cache::ParquetReadCache;
 use crate::io::FileIO;
 use crate::runtime::Runtime;
 use crate::util::available_parallelism;
@@ -54,6 +55,7 @@ pub struct ArrowReaderBuilder {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    parquet_read_cache: Option<ParquetReadCache>,
     runtime: Runtime,
 }
 
@@ -69,6 +71,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
             parquet_read_options: ParquetReadOptions::builder().build(),
+            parquet_read_cache: None,
             runtime,
         }
     }
@@ -124,6 +127,12 @@ impl ArrowReaderBuilder {
         self
     }
 
+    /// Sets the byte-range cache used for Parquet data files.
+    pub fn with_parquet_read_cache(mut self, cache: ParquetReadCache) -> Self {
+        self.parquet_read_cache = Some(cache);
+        self
+    }
+
     /// Build the ArrowReader.
     pub fn build(self) -> ArrowReader {
         ArrowReader {
@@ -138,6 +147,7 @@ impl ArrowReaderBuilder {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
+            parquet_read_cache: self.parquet_read_cache,
         }
     }
 }
@@ -155,4 +165,5 @@ pub struct ArrowReader {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    parquet_read_cache: Option<ParquetReadCache>,
 }

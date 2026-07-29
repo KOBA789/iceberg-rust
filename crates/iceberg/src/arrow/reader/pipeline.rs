@@ -33,6 +33,7 @@ use super::{
 };
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::arrow::int96::coerce_int96_timestamps;
+use crate::arrow::parquet_read_cache::{CachedFileRead, ParquetReadCache};
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::{CountingFileRead, ScanMetrics, ScanResult};
 use crate::error::Result;
@@ -58,6 +59,7 @@ impl ArrowReader {
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
             parquet_read_options: self.parquet_read_options,
+            parquet_read_cache: self.parquet_read_cache,
             scan_metrics: scan_metrics.clone(),
         };
 
@@ -99,6 +101,7 @@ struct FileScanTaskReader {
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
     parquet_read_options: ParquetReadOptions,
+    parquet_read_cache: Option<ParquetReadCache>,
     scan_metrics: ScanMetrics,
 }
 
@@ -119,6 +122,7 @@ impl FileScanTaskReader {
             &self.file_io,
             task.file_size_in_bytes,
             parquet_read_options,
+            self.parquet_read_cache,
             self.scan_metrics.bytes_read_counter(),
         )
         .await?;
@@ -414,11 +418,21 @@ impl ArrowReader {
         file_io: &FileIO,
         file_size_in_bytes: u64,
         parquet_read_options: ParquetReadOptions,
+        parquet_read_cache: Option<ParquetReadCache>,
         bytes_read: &Arc<AtomicU64>,
     ) -> Result<(ArrowFileReader, ArrowReaderMetadata)> {
         let parquet_file = file_io.new_input(data_file_path)?;
-        let counting_reader =
-            CountingFileRead::new(parquet_file.reader().await?, Arc::clone(bytes_read));
+        let parquet_reader = parquet_file.reader().await?;
+        let parquet_reader: Box<dyn FileRead> = match parquet_read_cache {
+            Some(cache) => Box::new(CachedFileRead::new(
+                parquet_reader,
+                Arc::from(data_file_path),
+                file_size_in_bytes,
+                cache,
+            )),
+            None => parquet_reader,
+        };
+        let counting_reader = CountingFileRead::new(parquet_reader, Arc::clone(bytes_read));
         Self::build_parquet_reader(
             Box::new(counting_reader),
             file_size_in_bytes,

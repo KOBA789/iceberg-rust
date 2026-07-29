@@ -32,6 +32,7 @@ use futures::{SinkExt, StreamExt, TryStreamExt};
 pub use task::*;
 
 use crate::arrow::ArrowReaderBuilder;
+use crate::arrow::parquet_read_cache::ParquetReadCache;
 pub use crate::arrow::{ScanMetrics, ScanResult};
 use crate::delete_file_index::DeleteFileIndex;
 use crate::expr::visitors::inclusive_metrics_evaluator::InclusiveMetricsEvaluator;
@@ -211,6 +212,7 @@ impl<'a> TableScanBuilder<'a> {
                         concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
+                        parquet_read_cache: self.table.parquet_read_cache().cloned(),
                         runtime: self.table.runtime().clone(),
                     });
                 };
@@ -325,6 +327,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            parquet_read_cache: self.table.parquet_read_cache().cloned(),
             runtime: self.table.runtime().clone(),
         })
     }
@@ -354,6 +357,7 @@ pub struct TableScan {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    parquet_read_cache: Option<ParquetReadCache>,
 
     runtime: Runtime,
 }
@@ -490,6 +494,10 @@ impl TableScan {
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
+        }
+
+        if let Some(cache) = &self.parquet_read_cache {
+            arrow_reader_builder = arrow_reader_builder.with_parquet_read_cache(cache.clone());
         }
 
         arrow_reader_builder

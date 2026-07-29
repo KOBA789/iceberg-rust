@@ -16,9 +16,13 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::time::UNIX_EPOCH;
 
 use aws_config::{BehaviorVersion, Region, SdkConfig};
-use aws_sdk_s3tables::config::Credentials;
+use aws_sdk_s3tables::config::{Credentials, ProvideCredentials, SharedCredentialsProvider};
+use iceberg_storage_opendal::{AwsCredential, CustomAwsCredentialLoader, ProvideCredential};
+use reqsign_core::time::Timestamp;
+use reqsign_core::{Context, Error, ErrorKind};
 
 /// Property aws profile name
 pub const AWS_PROFILE_NAME: &str = "profile_name";
@@ -64,6 +68,66 @@ pub(crate) async fn create_sdk_config(
     }
 
     config.load().await
+}
+
+#[derive(Debug, Clone)]
+struct AwsSdkCredentialProvider {
+    provider: SharedCredentialsProvider,
+}
+
+impl ProvideCredential for AwsSdkCredentialProvider {
+    type Credential = AwsCredential;
+
+    async fn provide_credential(
+        &self,
+        _context: &Context,
+    ) -> reqsign_core::Result<Option<Self::Credential>> {
+        let credentials = self.provider.provide_credentials().await.map_err(|error| {
+            Error::new(
+                ErrorKind::CredentialInvalid,
+                "AWS SDK credential provider failed",
+            )
+            .with_source(error)
+        })?;
+        let expires_in = credentials
+            .expiry()
+            .map(|expiry| {
+                expiry
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|error| {
+                        Error::new(
+                            ErrorKind::CredentialInvalid,
+                            "AWS credential expiry predates the Unix epoch",
+                        )
+                        .with_source(error)
+                    })
+                    .and_then(|duration| {
+                        i64::try_from(duration.as_millis())
+                            .map_err(|error| {
+                                Error::new(
+                                    ErrorKind::CredentialInvalid,
+                                    "AWS credential expiry is out of range",
+                                )
+                                .with_source(error)
+                            })
+                            .and_then(Timestamp::from_millisecond)
+                    })
+            })
+            .transpose()?;
+
+        Ok(Some(AwsCredential {
+            access_key_id: credentials.access_key_id().to_string(),
+            secret_access_key: credentials.secret_access_key().to_string(),
+            session_token: credentials.session_token().map(ToOwned::to_owned),
+            expires_in,
+        }))
+    }
+}
+
+pub(crate) fn sdk_credential_loader(config: &SdkConfig) -> Option<CustomAwsCredentialLoader> {
+    config
+        .credentials_provider()
+        .map(|provider| CustomAwsCredentialLoader::new(AwsSdkCredentialProvider { provider }))
 }
 
 #[cfg(test)]

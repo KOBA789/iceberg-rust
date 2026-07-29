@@ -37,6 +37,7 @@ aws-config = { workspace = true }
 aws-sdk-s3tables = { workspace = true }
 iceberg = { workspace = true }
 iceberg-storage-opendal = { workspace = true, features = ["opendal-s3"] }
+reqsign-core = { workspace = true }
 
 [dev-dependencies]
 arrow-array = { workspace = true }

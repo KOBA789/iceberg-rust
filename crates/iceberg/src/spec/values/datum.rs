@@ -1117,19 +1117,12 @@ impl Datum {
         match target_type {
             Type::Primitive(target_primitive_type) => {
                 match (&self.literal, &self.r#type, target_primitive_type) {
-                    (PrimitiveLiteral::Int(val), _, PrimitiveType::Int) => Ok(Datum::int(*val)),
-                    (PrimitiveLiteral::Int(val), _, PrimitiveType::Date) => Ok(Datum::date(*val)),
-                    (PrimitiveLiteral::Int(val), _, PrimitiveType::Long) => Ok(Datum::long(*val)),
-                    (PrimitiveLiteral::Long(val), _, PrimitiveType::Int) => {
-                        Ok(Datum::i64_to_i32(*val))
+                    (PrimitiveLiteral::Int(val), source_type, target_type) => {
+                        convert_int(*val, source_type, target_type)
                     }
-                    (PrimitiveLiteral::Long(val), _, PrimitiveType::Timestamp) => {
-                        Ok(Datum::timestamp_micros(*val))
+                    (PrimitiveLiteral::Long(val), source_type, target_type) => {
+                        convert_long(*val, source_type, target_type)
                     }
-                    (PrimitiveLiteral::Long(val), _, PrimitiveType::Timestamptz) => {
-                        Ok(Datum::timestamptz_micros(*val))
-                    }
-                    // Let's wait with nano's until this clears up: https://github.com/apache/iceberg/pull/11775
                     (PrimitiveLiteral::Int128(val), _, PrimitiveType::Long) => {
                         Ok(Datum::i128_to_i64(*val))
                     }
@@ -1231,4 +1224,111 @@ impl Datum {
             _ => self.to_string(),
         }
     }
+}
+
+const MICROS_PER_DAY: i64 = 24 * 60 * 60 * 1_000_000;
+const NANOS_PER_MICRO: i64 = 1_000;
+const NANOS_PER_DAY: i64 = NANOS_PER_MICRO * MICROS_PER_DAY;
+
+fn convert_int(
+    val: i32,
+    source_type: &PrimitiveType,
+    target_type: &PrimitiveType,
+) -> Result<Datum> {
+    let datum = match (source_type, target_type) {
+        (_, PrimitiveType::Int) => Datum::int(val),
+        (_, PrimitiveType::Date) => Datum::date(val),
+        (_, PrimitiveType::Long) => Datum::long(val),
+        (PrimitiveType::Date, PrimitiveType::Timestamp) => Datum::timestamp_micros(
+            (val as i64)
+                .checked_mul(MICROS_PER_DAY)
+                .ok_or_else(integer_overflow)?,
+        ),
+        (PrimitiveType::Date, PrimitiveType::Timestamptz) => Datum::timestamptz_micros(
+            (val as i64)
+                .checked_mul(MICROS_PER_DAY)
+                .ok_or_else(integer_overflow)?,
+        ),
+        (PrimitiveType::Date, PrimitiveType::TimestampNs) => Datum::timestamp_nanos(
+            (val as i64)
+                .checked_mul(NANOS_PER_DAY)
+                .ok_or_else(integer_overflow)?,
+        ),
+        (PrimitiveType::Date, PrimitiveType::TimestamptzNs) => Datum::timestamptz_nanos(
+            (val as i64)
+                .checked_mul(NANOS_PER_DAY)
+                .ok_or_else(integer_overflow)?,
+        ),
+        _ => {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Can't convert datum from {source_type} type to {target_type} type."),
+            ));
+        }
+    };
+
+    Ok(datum)
+}
+
+fn convert_long(
+    val: i64,
+    source_type: &PrimitiveType,
+    target_type: &PrimitiveType,
+) -> Result<Datum> {
+    let datum = match (source_type, target_type) {
+        (_, PrimitiveType::Int) => Datum::i64_to_i32(val),
+        (_, PrimitiveType::Long) => Datum::long(val),
+        (
+            PrimitiveType::Long | PrimitiveType::Timestamp | PrimitiveType::Timestamptz,
+            PrimitiveType::Timestamp,
+        ) => Datum::timestamp_micros(val),
+        (
+            PrimitiveType::Long | PrimitiveType::Timestamp | PrimitiveType::Timestamptz,
+            PrimitiveType::Timestamptz,
+        ) => Datum::timestamptz_micros(val),
+        (
+            PrimitiveType::Long | PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs,
+            PrimitiveType::TimestampNs,
+        ) => Datum::timestamp_nanos(val),
+        (
+            PrimitiveType::Long | PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs,
+            PrimitiveType::TimestamptzNs,
+        ) => Datum::timestamptz_nanos(val),
+        (PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs, PrimitiveType::Timestamp) => {
+            Datum::timestamp_micros(val / NANOS_PER_MICRO)
+        }
+        (PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs, PrimitiveType::Timestamptz) => {
+            Datum::timestamptz_micros(val / NANOS_PER_MICRO)
+        }
+        (PrimitiveType::Timestamp | PrimitiveType::Timestamptz, PrimitiveType::TimestampNs) => {
+            Datum::timestamp_nanos(
+                val.checked_mul(NANOS_PER_MICRO)
+                    .ok_or_else(integer_overflow)?,
+            )
+        }
+        (PrimitiveType::Timestamp | PrimitiveType::Timestamptz, PrimitiveType::TimestamptzNs) => {
+            Datum::timestamptz_nanos(
+                val.checked_mul(NANOS_PER_MICRO)
+                    .ok_or_else(integer_overflow)?,
+            )
+        }
+        (PrimitiveType::Timestamp | PrimitiveType::Timestamptz, PrimitiveType::Date) => {
+            Datum::date((val / MICROS_PER_DAY) as i32)
+        }
+        (PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs, PrimitiveType::Date) => {
+            Datum::date((val / NANOS_PER_DAY) as i32)
+        }
+        _ => {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Can't convert datum from {source_type} type to {target_type} type."),
+            ));
+        }
+    };
+
+    Ok(datum)
+}
+
+fn integer_overflow() -> Error {
+    Error::new(ErrorKind::DataInvalid, "integer overflow")
 }

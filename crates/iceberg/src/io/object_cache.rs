@@ -50,6 +50,19 @@ pub struct ObjectCache {
 }
 
 impl ObjectCache {
+    pub(crate) fn with_shared_cache(
+        file_io: FileIO,
+        source: &ObjectCache,
+        encryption_manager: Option<Arc<EncryptionManager>>,
+    ) -> Self {
+        Self {
+            cache: source.cache.clone(),
+            file_io,
+            cache_disabled: source.cache_disabled,
+            encryption_manager,
+        }
+    }
+
     /// Creates a new [`ObjectCache`]
     /// with the default cache size
     pub(crate) fn new(file_io: FileIO, encryption_manager: Option<Arc<EncryptionManager>>) -> Self {
